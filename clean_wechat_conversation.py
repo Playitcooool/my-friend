@@ -8,7 +8,7 @@ from typing import Any
 
 DEFAULT_INPUT = Path("huxinyi_raw_frame_items.jsonl")
 DEFAULT_ITEMS_OUTPUT = Path("huxinyi_clean_items.jsonl")
-DEFAULT_MESSAGES_OUTPUT = Path("huxinyi_clean_messages.json")
+DEFAULT_MESSAGES_OUTPUT = Path("huxinyi_clean_messages.jsonl")
 
 TEXT_TYPES = {"text"}
 MEDIA_TYPES = {"image", "sticker", "voice", "file", "transfer"}
@@ -299,6 +299,37 @@ def trim_dangling_final_user(
     return messages, 0
 
 
+def build_sft_pairs(
+    messages: list[dict[str, str]],
+) -> tuple[list[dict[str, list[dict[str, str]]]], Counter[str]]:
+    stats: Counter[str] = Counter()
+    pairs = []
+    pending_user: dict[str, str] | None = None
+
+    for message in messages:
+        role = message["role"]
+        if role == "user":
+            if pending_user is not None:
+                stats["dropped_unanswered_user_messages"] += 1
+            pending_user = message
+            continue
+
+        if role == "assistant":
+            if pending_user is None:
+                stats["dropped_leading_assistant_messages"] += 1
+                continue
+
+            pairs.append({"messages": [pending_user, message]})
+            pending_user = None
+            continue
+
+    if pending_user is not None:
+        stats["dropped_unanswered_user_messages"] += 1
+
+    stats["pairs"] = len(pairs)
+    return pairs, stats
+
+
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
@@ -346,14 +377,12 @@ def main() -> None:
     trimmed_final_user_messages = 0
     if not args.keep_dangling_final_user:
         messages, trimmed_final_user_messages = trim_dangling_final_user(messages)
+    pairs, pair_stats = build_sft_pairs(messages)
 
     write_jsonl(args.items_output, items)
-    args.messages_output.write_text(
-        json.dumps({"messages": messages}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    write_jsonl(args.messages_output, pairs)
 
-    stats = load_stats + clean_stats
+    stats = load_stats + clean_stats + pair_stats
     stats["messages"] = len(messages)
     stats["trimmed_final_user_messages"] = trimmed_final_user_messages
 
@@ -363,7 +392,8 @@ def main() -> None:
         f"deduped {stats['deduped_items']} overlaps, "
         f"collapsed {stats['adjacent_frame_duplicates']} adjacent frame duplicates, "
         f"trimmed {stats['trimmed_final_user_messages']} dangling final user messages, "
-        f"merged into {stats['messages']} messages."
+        f"merged into {stats['messages']} messages, "
+        f"wrote {stats['pairs']} SFT pairs."
     )
     print(f"Wrote {args.items_output}")
     print(f"Wrote {args.messages_output}")
