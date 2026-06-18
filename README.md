@@ -9,7 +9,7 @@ Create a project virtual environment with `uv`, then install dependencies:
 
 ```bash
 uv venv
-uv pip install openai
+uv pip install openai "mlx-lm[train]"
 ```
 
 ## Usage
@@ -34,3 +34,101 @@ INCLUDE_RAW=1
 
 Local videos, frame images, and JSONL extraction outputs are intentionally
 ignored and should not be committed.
+
+## Clean Conversation Data
+
+Clean the frame-level extraction into bubble-level JSONL and SFT pair JSONL:
+
+```bash
+python clean_wechat_conversation.py
+```
+
+Outputs:
+
+```bash
+huxinyi_clean_items.jsonl
+huxinyi_clean_messages.jsonl
+```
+
+`huxinyi_clean_messages.jsonl` contains one training example per line:
+
+```json
+{"messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}
+```
+
+The cleaner removes overlapping frame duplicates, recall notices, quoted-message
+prefixes, incomplete edge bubbles, and dangling final user messages.
+
+## LoRA Fine-Tuning with MLX-LM
+
+MLX-LM expects local fine-tuning data in a directory containing `train.jsonl`.
+Create the data directory and use the cleaned JSONL as the training split:
+
+```bash
+mkdir -p data
+cp huxinyi_clean_messages.jsonl data/train.jsonl
+```
+
+Optional validation split:
+
+```bash
+cp huxinyi_clean_messages.jsonl data/valid.jsonl
+```
+
+Fine-tune using the project config:
+
+```bash
+mlx_lm.lora --config lora_config.yaml
+```
+
+Equivalent explicit command:
+
+```bash
+mlx_lm.lora \
+  --model "/Volumes/Samsung/lmstudio/lmstudio-community/lmstudio-community:Qwen3.5-4B-MLX-8bit" \
+  --train \
+  --fine-tune-type lora \
+  --data ./data \
+  --adapter-path ./adapters/huxinyi \
+  --batch-size 1 \
+  --iters 1000 \
+  --learning-rate 1e-5 \
+  --num-layers 4 \
+  --max-seq-length 1024 \
+  --grad-checkpoint \
+  --mask-prompt
+```
+
+The adapter weights are written to:
+
+```bash
+adapters/huxinyi/
+```
+
+## Inference with MLX-LM
+
+Generate with the base model plus the trained LoRA adapter:
+
+```bash
+mlx_lm.generate \
+  --model "/Volumes/Samsung/lmstudio/lmstudio-community/lmstudio-community:Qwen3.5-4B-MLX-8bit" \
+  --adapter-path ./adapters/huxinyi \
+  --prompt "晚上想吃什么？" \
+  --max-tokens 256 \
+  --temp 0.7
+```
+
+For chat-style prompts, format the prompt as a user turn:
+
+```bash
+mlx_lm.generate \
+  --model "/Volumes/Samsung/lmstudio/lmstudio-community/lmstudio-community:Qwen3.5-4B-MLX-8bit" \
+  --adapter-path ./adapters/huxinyi \
+  --prompt '<|im_start|>user
+晚上想吃什么？
+<|im_end|>
+<|im_start|>assistant
+' \
+  --max-tokens 256 \
+  --temp 0.7
+```
