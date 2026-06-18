@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local source media and extracted frames.
+*.mp4
+*.mov
+*.m4v
+*.avi
+*.mkv
+frames/
+*_frames/
+
+# Local model outputs / extracted message data.
+*.jsonl
+outputs/
