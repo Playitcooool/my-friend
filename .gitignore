@@ -17,3 +17,4 @@ outputs/
 *.json
 adapters/
 *.png
+lora_config.yaml
