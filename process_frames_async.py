@@ -12,10 +12,10 @@ from openai import AsyncOpenAI
 BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
 MODEL = os.getenv("LOCAL_LLM_MODEL", "lmstudio-community:Qwen3.5-4B-MLX-8bit")
 
-FRAMES_DIR = Path(os.getenv("FRAMES_DIR", "frames"))
+FRAMES_DIR = Path(os.getenv("FRAMES_DIR", "huxinyi_frames"))
 
 # 注意：换新文件，别和旧的 messages schema 混在一起
-OUTPUT_PATH = Path(os.getenv("OUTPUT_PATH", "raw_frame_items.jsonl"))
+OUTPUT_PATH = Path(os.getenv("OUTPUT_PATH", "huxinyi_raw_frame_items.jsonl"))
 
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
@@ -284,62 +284,75 @@ def normalize_items(parsed: dict) -> list[dict]:
     return cleaned
 
 
-async def parse_one_frame(frame_path: Path, sem: asyncio.Semaphore) -> dict:
-    async with sem:
-        started_at = time.perf_counter()
-        for attempt in range(1, MAX_RETRIES + 2):
-            try:
-                image_url = image_to_data_url(frame_path)
+async def parse_one_frame(frame_path: Path) -> dict:
+    started_at = time.perf_counter()
+    frame_index = frame_index_from_name(frame_path)
 
-                resp = await client.chat.completions.create(
-                    model=MODEL,
-                    temperature=0,
-                    max_tokens=2048,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": PROMPT},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": image_url},
-                                },
-                            ],
-                        }
-                    ],
-                )
+    try:
+        image_url = image_to_data_url(frame_path)
+    except Exception as e:
+        return {
+            "frame": frame_path.name,
+            "frame_index": frame_index,
+            "ok": False,
+            "error": repr(e),
+            "_elapsed_seconds": time.perf_counter() - started_at,
+            "_attempts": 0,
+        }
 
-                raw = get_raw_content(resp)
-                parsed = extract_json(raw)
-                items = normalize_items(parsed)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": PROMPT},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                },
+            ],
+        }
+    ]
 
-                result = {
-                    "frame": frame_path.name,
-                    "frame_index": frame_index_from_name(frame_path),
-                    "ok": True,
-                    "items": items,
-                }
+    for attempt in range(1, MAX_RETRIES + 2):
+        try:
+            resp = await client.chat.completions.create(
+                model=MODEL,
+                temperature=0,
+                max_tokens=2048,
+                messages=messages,
+            )
 
-                if INCLUDE_RAW:
-                    result["raw"] = raw
+            raw = get_raw_content(resp)
+            parsed = extract_json(raw)
+            items = normalize_items(parsed)
 
-                result["_elapsed_seconds"] = time.perf_counter() - started_at
-                result["_attempts"] = attempt
-                return result
+            result = {
+                "frame": frame_path.name,
+                "frame_index": frame_index,
+                "ok": True,
+                "items": items,
+            }
 
-            except Exception as e:
-                if attempt <= MAX_RETRIES:
-                    await asyncio.sleep(0.8 * attempt)
-                    continue
+            if INCLUDE_RAW:
+                result["raw"] = raw
 
-                return {
-                    "frame": frame_path.name,
-                    "frame_index": frame_index_from_name(frame_path),
-                    "ok": False,
-                    "error": repr(e),
-                    "_elapsed_seconds": time.perf_counter() - started_at,
-                    "_attempts": attempt,
-                }
+            result["_elapsed_seconds"] = time.perf_counter() - started_at
+            result["_attempts"] = attempt
+            return result
+
+        except Exception as e:
+            if attempt <= MAX_RETRIES:
+                await asyncio.sleep(0.8 * attempt)
+                continue
+
+            return {
+                "frame": frame_path.name,
+                "frame_index": frame_index,
+                "ok": False,
+                "error": repr(e),
+                "_elapsed_seconds": time.perf_counter() - started_at,
+                "_attempts": attempt,
+            }
 
 
 async def main():
@@ -362,24 +375,27 @@ async def main():
         print("Nothing to do.")
         return
 
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
     write_lock = asyncio.Lock()
+    frame_queue: asyncio.Queue[Path | None] = asyncio.Queue()
 
     completed = 0
     total = len(todo)
     run_started_at = time.perf_counter()
 
-    async def worker(frame: Path):
+    for frame in todo:
+        frame_queue.put_nowait(frame)
+    for _ in range(MAX_CONCURRENCY):
+        frame_queue.put_nowait(None)
+
+    async def handle_result(frame: Path, item: dict, out: Any):
         nonlocal completed
 
-        item = await parse_one_frame(frame, sem)
         elapsed_seconds = item.pop("_elapsed_seconds", None)
         attempts = item.pop("_attempts", None)
 
         async with write_lock:
-            with OUTPUT_PATH.open("a", encoding="utf-8") as out:
-                out.write(json.dumps(item, ensure_ascii=False) + "\n")
-                out.flush()
+            out.write(json.dumps(item, ensure_ascii=False) + "\n")
+            out.flush()
 
             completed += 1
             status = "OK" if item.get("ok") else "ERR"
@@ -402,8 +418,22 @@ async def main():
                 f" rate={frames_per_minute:.1f}/min eta={eta_seconds / 60:.1f}m"
             )
 
-    tasks = [asyncio.create_task(worker(frame)) for frame in todo]
-    await asyncio.gather(*tasks)
+    async def worker(out: Any):
+        while True:
+            frame = await frame_queue.get()
+            try:
+                if frame is None:
+                    return
+
+                item = await parse_one_frame(frame)
+                await handle_result(frame, item, out)
+            finally:
+                frame_queue.task_done()
+
+    with OUTPUT_PATH.open("a", encoding="utf-8") as out:
+        tasks = [asyncio.create_task(worker(out)) for _ in range(MAX_CONCURRENCY)]
+        await frame_queue.join()
+        await asyncio.gather(*tasks)
 
     total_elapsed = time.perf_counter() - run_started_at
     print(
