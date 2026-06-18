@@ -9,15 +9,15 @@ Create a project virtual environment with `uv`, then install dependencies:
 
 ```bash
 uv venv
-uv pip install openai "mlx-lm[train]"
+uv pip install openai "mlx-lm[train]" pyobjc-framework-Vision pyobjc-framework-Quartz pillow
 ```
 
 ## Usage
 
-Put extracted screenshot frames in `frames/`, then run:
+Put extracted screenshot frames in `frames/`, then run the default OCR extractor:
 
 ```bash
-python process_frames_async.py
+python process_frames.py
 ```
 
 Useful environment variables:
@@ -31,6 +31,19 @@ MAX_CONCURRENCY=2
 MAX_RETRIES=2
 INCLUDE_RAW=1
 ```
+
+Choose the extraction backend explicitly when needed:
+
+```bash
+python process_frames.py --method ocr
+python process_frames.py --method vlm
+python process_frames.py --method ocr-with-vlm-fallback
+```
+
+OCR uses Apple Vision and groups OCR text lines into detected WeChat bubbles by
+default. Use `--disable-bubble-grouping` to compare against the previous
+line-level OCR items. VLM extraction is available through the same
+`process_frames.py` entry point.
 
 Local videos, frame images, and JSONL extraction outputs are intentionally
 ignored and should not be committed.
