@@ -16,3 +16,4 @@ frames/
 outputs/
 *.json
 adapters/
+*.png
