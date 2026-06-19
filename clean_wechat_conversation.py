@@ -5,10 +5,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-
-DEFAULT_INPUT = Path("huxinyi_raw_frame_items.jsonl")
-DEFAULT_ITEMS_OUTPUT = Path("huxinyi_clean_items.jsonl")
-DEFAULT_MESSAGES_OUTPUT = Path("huxinyi_clean_messages.jsonl")
+DEFAULT_INPUT = Path(
+    "/Volumes/Samsung/Projects/my-friend/maruixiao_ocr_raw_frame_items.jsonl"
+)
+DEFAULT_MESSAGES_OUTPUT = Path("data/train.jsonl")
 
 TEXT_TYPES = {"text"}
 MEDIA_TYPES = {"image", "sticker", "voice", "file", "transfer"}
@@ -43,7 +43,9 @@ def is_quote_notice(content: str) -> bool:
     return any(pattern.match(content) for pattern in QUOTE_PREFIX_PATTERNS)
 
 
-def normalize_item(raw_item: dict[str, Any], frame: dict[str, Any]) -> dict[str, Any] | None:
+def normalize_item(
+    raw_item: dict[str, Any], frame: dict[str, Any]
+) -> dict[str, Any] | None:
     content = raw_item.get("content")
     if not isinstance(content, str):
         return None
@@ -331,6 +333,7 @@ def build_sft_pairs(
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -341,7 +344,12 @@ def parse_args() -> argparse.Namespace:
         description="Clean overlapping WeChat frame extraction JSONL into conversation data."
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--items-output", type=Path, default=DEFAULT_ITEMS_OUTPUT)
+    parser.add_argument(
+        "--items-output",
+        type=Path,
+        default=None,
+        help="Optional debug output for cleaned bubble-level items.",
+    )
     parser.add_argument("--messages-output", type=Path, default=DEFAULT_MESSAGES_OUTPUT)
     parser.add_argument("--lookback", type=int, default=80)
     parser.add_argument("--min-overlap", type=int, default=2)
@@ -379,7 +387,8 @@ def main() -> None:
         messages, trimmed_final_user_messages = trim_dangling_final_user(messages)
     pairs, pair_stats = build_sft_pairs(messages)
 
-    write_jsonl(args.items_output, items)
+    if args.items_output is not None:
+        write_jsonl(args.items_output, items)
     write_jsonl(args.messages_output, pairs)
 
     stats = load_stats + clean_stats + pair_stats
@@ -395,7 +404,8 @@ def main() -> None:
         f"merged into {stats['messages']} messages, "
         f"wrote {stats['pairs']} SFT pairs."
     )
-    print(f"Wrote {args.items_output}")
+    if args.items_output is not None:
+        print(f"Wrote {args.items_output}")
     print(f"Wrote {args.messages_output}")
 
 

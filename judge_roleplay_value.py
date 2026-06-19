@@ -2,9 +2,10 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
-
+from urllib.parse import urlparse
 
 DEFAULT_INPUT = Path("data/train.jsonl")
 DEFAULT_OUTPUT = Path("data/train.roleplay_filtered.jsonl")
@@ -20,24 +21,53 @@ MIN_RATING_ORDER = {
     "invalid": 0,
 }
 
-SYSTEM_PROMPT = """You are judging chat fine-tuning examples for roleplay value.
+SYSTEM_PROMPT = """You are judging Chinese WeChat chat fine-tuning examples for personal chat style value.
+
+The goal is to select examples that help a model learn the assistant speaker's natural WeChat style:
+- wording habits
+- rhythm and line breaks
+- emotional stance
+- teasing, humor, hesitation, complaints, reactions
+- relationship dynamic
+- casual short replies when they are meaningful in context
+
+Do NOT judge by whether the assistant sounds formal, helpful, or like an AI assistant.
+Natural WeChat messages can be short, fragmented, emotional, repetitive, or informal.
 
 Return strict JSON only with these keys:
 - rating: one of high, medium, low, incomplete, invalid
 - keep: boolean
-- style_signal: short description of the character/style signal
+- style_score: integer from 1 to 5
+- context_score: integer from 1 to 5
+- quality_score: integer from 1 to 5
+- privacy_risk: one of low, medium, high
+- short_reply_type: one of none, useful_style, generic_ack, duplicate_noise
+- style_signal: short description of the useful style signal
 - issues: list of short issue labels
 - reason: concise explanation
 
-Criteria:
-- high: assistant reply strongly mirrors persona, wording, rhythm, humor, catchphrases, emotional stance, or relationship dynamic.
-- medium: usable and coherent, with some style/persona signal.
-- low: generic, bland, too short, weak persona signal, or mostly factual.
-- incomplete: response or prompt appears cut off, context is missing, OCR corruption breaks meaning, or assistant answer is dangling.
+Rating criteria:
+- high: strong assistant style signal. The assistant reply shows distinctive wording, rhythm, emotion, humor, teasing, hesitation, catchphrases, or relationship dynamic.
+- medium: coherent and usable. Some style signal, even if not very strong.
+- low: coherent but weak style signal, too generic, mostly factual, or not very useful for learning this person's style.
+- incomplete: context is missing, OCR corruption breaks meaning, role assignment seems wrong, message appears cut off, or assistant answer is dangling.
 - invalid: malformed message schema.
 
-Keep should be true only for high or medium examples that are not incomplete or invalid.
-Be strict about examples that are generic, contextless, OCR-corrupted, or cut off."""
+Short reply policy:
+- Do NOT automatically reject short replies.
+- Short replies like "?", "哦哦哦", "笑死", "不是吧", "我好累", "好讨厌" can be useful if they express style or fit the context.
+- Generic acknowledgements like "嗯", "对", "好", "ok" are usually low unless the context makes them stylistically meaningful.
+- Repeated generic short replies should be marked as duplicate_noise or generic_ack.
+
+Privacy policy:
+- privacy_risk=high if the sample contains phone numbers, addresses, IDs, exact private locations, health/financial details, or highly sensitive personal information.
+- privacy_risk=medium if it contains real names, schools, workplaces, travel plans, relationship details, or identifiable third-party references.
+- privacy_risk=low if there is no obvious sensitive or identifying information.
+
+Keep policy:
+- keep=true only if rating is high or medium, quality_score >= 4, context_score >= 3, and privacy_risk is not high.
+- keep=false for incomplete, invalid, obvious OCR errors, role confusion, cut-off replies, high privacy risk, or duplicate noise.
+"""
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,12 +76,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--judgments-output", type=Path, default=DEFAULT_JUDGMENTS_OUTPUT)
-    parser.add_argument("--base-url", default=os.getenv("OPENAI_BASE_URL"))
-    parser.add_argument("--api-key", default=os.getenv("OPENAI_API_KEY"))
-    parser.add_argument("--model", default=os.getenv("ROLEPLAY_JUDGE_MODEL"))
+    parser.add_argument(
+        "--judgments-output", type=Path, default=DEFAULT_JUDGMENTS_OUTPUT
+    )
+    parser.add_argument("--base-url", default="http://localhost:1234")
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--model", default="mlx-community:Qwen3.5-9B-MLX-4bit")
     parser.add_argument("--max-concurrency", type=int, default=4)
     parser.add_argument("--max-retries", type=int, default=2)
+    parser.add_argument("--request-timeout", type=float, default=120.0)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--min-rating",
@@ -66,6 +99,20 @@ def parse_args() -> argparse.Namespace:
         help="Only process the first N non-empty input lines.",
     )
     return parser.parse_args()
+
+
+def log(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def normalize_base_url(base_url: str | None) -> str | None:
+    if not base_url:
+        return None
+
+    parsed = urlparse(base_url)
+    if parsed.scheme and parsed.netloc and parsed.path in {"", "/"}:
+        return base_url.rstrip("/") + "/v1"
+    return base_url
 
 
 def normalize_judgment(raw: Any) -> dict[str, Any]:
@@ -124,7 +171,9 @@ def validate_messages(obj: Any) -> tuple[bool, str]:
 
 
 def message_signature(obj: dict[str, Any]) -> str:
-    return json.dumps(obj["messages"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        obj["messages"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
 
 
 def make_record(
@@ -143,7 +192,9 @@ def make_record(
     }
 
 
-def load_input(path: Path, limit: int | None) -> list[tuple[int, str, dict[str, Any] | None, str | None]]:
+def load_input(
+    path: Path, limit: int | None
+) -> list[tuple[int, str, dict[str, Any] | None, str | None]]:
     rows = []
     with path.open("r", encoding="utf-8") as f:
         for line_number, line in enumerate(f, start=1):
@@ -178,7 +229,9 @@ def load_existing_judgments(path: Path) -> dict[int, dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
             line_number = record.get("line_number")
-            if isinstance(line_number, int) and isinstance(record.get("judgment"), dict):
+            if isinstance(line_number, int) and isinstance(
+                record.get("judgment"), dict
+            ):
                 existing[line_number] = record
     return existing
 
@@ -241,6 +294,8 @@ async def judge_pending(
     model: str,
     max_concurrency: int,
     max_retries: int,
+    request_timeout: float,
+    on_result: Any | None = None,
 ) -> dict[int, dict[str, Any]]:
     try:
         from openai import AsyncOpenAI
@@ -257,19 +312,33 @@ async def judge_pending(
         client_kwargs["api_key"] = "not-needed"
     if base_url:
         client_kwargs["base_url"] = base_url
+    client_kwargs["timeout"] = request_timeout
     client = AsyncOpenAI(**client_kwargs)
 
     semaphore = asyncio.Semaphore(max(1, max_concurrency))
     results: dict[int, dict[str, Any]] = {}
+    total = len(pending)
+    completed = 0
+
+    log(
+        f"Starting judge calls: {total} rows, model={model}, "
+        f"base_url={base_url or 'OpenAI SDK default'}, concurrency={max_concurrency}"
+    )
 
     async def run(line_number: int, obj: dict[str, Any]) -> None:
+        nonlocal completed
         async with semaphore:
+            log(f"Requesting judgment for line {line_number}")
             results[line_number] = await judge_one(
                 client=client,
                 model=model,
                 messages=obj["messages"],
                 max_retries=max_retries,
             )
+            if on_result is not None:
+                on_result(line_number, results[line_number])
+            completed += 1
+            log(f"Completed {completed}/{total} judgments")
 
     await asyncio.gather(*(run(line_number, obj) for line_number, obj in pending))
     return results
@@ -279,7 +348,10 @@ def should_keep(judgment: dict[str, Any], min_rating: str) -> bool:
     rating = judgment.get("rating")
     if rating not in MIN_RATING_ORDER:
         return False
-    return bool(judgment.get("keep")) and MIN_RATING_ORDER[rating] >= MIN_RATING_ORDER[min_rating]
+    return (
+        bool(judgment.get("keep"))
+        and MIN_RATING_ORDER[rating] >= MIN_RATING_ORDER[min_rating]
+    )
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -289,8 +361,16 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
+def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        f.flush()
+
+
 async def async_main() -> int:
     args = parse_args()
+    args.base_url = normalize_base_url(args.base_url)
     if not args.model:
         raise SystemExit(
             "A judge model is required. Pass --model or set ROLEPLAY_JUDGE_MODEL."
@@ -299,9 +379,12 @@ async def async_main() -> int:
         raise SystemExit("--max-concurrency must be at least 1.")
     if args.max_retries < 0:
         raise SystemExit("--max-retries must be at least 0.")
+    if args.request_timeout <= 0:
+        raise SystemExit("--request-timeout must be greater than 0.")
 
     input_rows = load_input(args.input, args.limit)
     existing = load_existing_judgments(args.judgments_output) if args.resume else {}
+    log(f"Loaded {len(input_rows)} input rows from {args.input}")
 
     records_by_line: dict[int, dict[str, Any]] = {}
     pending: list[tuple[int, dict[str, Any]]] = []
@@ -345,7 +428,43 @@ async def async_main() -> int:
         seen_signatures[signature] = line_number
         pending.append((line_number, obj))
 
+    log(f"Prepared {len(pending)} rows for LLM judging")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text("", encoding="utf-8")
+    log(f"Initialized filtered output at {args.output}")
+
+    args.judgments_output.parent.mkdir(parents=True, exist_ok=True)
+    args.judgments_output.write_text("", encoding="utf-8")
+    for line_number in sorted(records_by_line):
+        record = records_by_line[line_number]
+        append_jsonl(args.judgments_output, record)
+        if record.get("duplicate_of_line") is None and should_keep(
+            record["judgment"], args.min_rating
+        ):
+            try:
+                append_jsonl(args.output, json.loads(record["row"]))
+            except (json.JSONDecodeError, TypeError):
+                pass
+    log(f"Initialized incremental judgments at {args.judgments_output}")
+
     if pending:
+        raw_by_line = {
+            line_number: raw_line for line_number, raw_line, _, _ in input_rows
+        }
+        obj_by_line = {line_number: obj for line_number, _, obj, _ in input_rows if obj}
+
+        def record_result(line_number: int, judgment: dict[str, Any]) -> None:
+            record = make_record(
+                line_number,
+                raw_by_line[line_number],
+                obj_by_line[line_number],
+                judgment,
+            )
+            records_by_line[line_number] = record
+            append_jsonl(args.judgments_output, record)
+            if should_keep(record["judgment"], args.min_rating):
+                append_jsonl(args.output, obj_by_line[line_number])
+
         judgments = await judge_pending(
             pending=pending,
             api_key=args.api_key,
@@ -353,16 +472,17 @@ async def async_main() -> int:
             model=args.model,
             max_concurrency=args.max_concurrency,
             max_retries=args.max_retries,
+            request_timeout=args.request_timeout,
+            on_result=record_result,
         )
-        raw_by_line = {line_number: raw_line for line_number, raw_line, _, _ in input_rows}
-        obj_by_line = {line_number: obj for line_number, _, obj, _ in input_rows if obj}
         for line_number, judgment in judgments.items():
-            records_by_line[line_number] = make_record(
-                line_number,
-                raw_by_line[line_number],
-                obj_by_line[line_number],
-                judgment,
-            )
+            if line_number not in records_by_line:
+                records_by_line[line_number] = make_record(
+                    line_number,
+                    raw_by_line[line_number],
+                    obj_by_line[line_number],
+                    judgment,
+                )
 
     judgment_rows = [records_by_line[line_number] for line_number, *_ in input_rows]
     kept_rows = []
@@ -372,13 +492,17 @@ async def async_main() -> int:
             obj = json.loads(record["row"])
         except (json.JSONDecodeError, TypeError):
             pass
-        if obj and record.get("duplicate_of_line") is None and should_keep(
-            record["judgment"], args.min_rating
+        if (
+            obj
+            and record.get("duplicate_of_line") is None
+            and should_keep(record["judgment"], args.min_rating)
         ):
             kept_rows.append(obj)
 
     write_jsonl(args.judgments_output, judgment_rows)
     write_jsonl(args.output, kept_rows)
+    log(f"Wrote sorted judgments to {args.judgments_output}")
+    log(f"Wrote filtered rows to {args.output}")
 
     rating_counts: dict[str, int] = {}
     for record in judgment_rows:
