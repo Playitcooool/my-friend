@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -70,9 +71,26 @@ Keep policy:
 """
 
 
+def artifact_prefix(name: str) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip()).strip("._-")
+    if not prefix:
+        raise ValueError("--name must contain at least one filename-safe character.")
+    return prefix
+
+
+def option_was_provided(option: str) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in sys.argv[1:])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Judge roleplay value for JSONL chat examples and write filtered outputs."
+        description="Judge roleplay value for JSONL chat examples and write filtered SFT data.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Optional local artifact prefix, e.g. reads data/NAME_train.jsonl and writes data/NAME.roleplay_filtered.jsonl.",
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -98,7 +116,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Only process the first N non-empty input lines.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.name:
+        prefix = artifact_prefix(args.name)
+        if not option_was_provided("--input"):
+            args.input = Path("data") / f"{prefix}_train.jsonl"
+        if not option_was_provided("--output"):
+            args.output = Path("data") / f"{prefix}.roleplay_filtered.jsonl"
+        if not option_was_provided("--judgments-output"):
+            args.judgments_output = Path("data") / f"{prefix}.roleplay_judgments.jsonl"
+    return args
 
 
 def log(message: str) -> None:

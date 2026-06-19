@@ -1,9 +1,9 @@
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
-
 
 DEFAULT_ADAPTER_PATH = Path("adapters/contact")
 DEFAULT_MODEL = "Qwen:Qwen3-14B-MLX-8bit"
@@ -12,9 +12,26 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+def artifact_prefix(name: str) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip()).strip("._-")
+    if not prefix:
+        raise ValueError("--name must contain at least one filename-safe character.")
+    return prefix
+
+
+def option_was_provided(option: str) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in sys.argv[1:])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Load an MLX-LM base model with LoRA adapters and chat in the terminal."
+        description="Load an MLX-LM base model with LoRA adapters and chat in the terminal.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Optional local artifact prefix, e.g. uses adapters/NAME.",
     )
     parser.add_argument("--model", default=None, help="Base model path or HF repo.")
     parser.add_argument(
@@ -49,7 +66,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Pass enable_thinking=True to supported chat templates.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.name and not option_was_provided("--adapter-path"):
+        args.adapter_path = Path("adapters") / artifact_prefix(args.name)
+    return args
 
 
 def load_adapter_model_path(adapter_path: Path) -> str | None:
@@ -67,7 +87,10 @@ def load_adapter_model_path(adapter_path: Path) -> str | None:
 
 
 def build_messages(
-    history: list[dict[str, str]], system_prompt: str, include_system: bool, history_turns: int
+    history: list[dict[str, str]],
+    system_prompt: str,
+    include_system: bool,
+    history_turns: int,
 ) -> list[dict[str, str]]:
     if history_turns > 0:
         trimmed_history = history[-history_turns * 2 :]
@@ -81,7 +104,9 @@ def build_messages(
     return messages
 
 
-def apply_chat_template(tokenizer: Any, messages: list[dict[str, str]], enable_thinking: bool) -> str:
+def apply_chat_template(
+    tokenizer: Any, messages: list[dict[str, str]], enable_thinking: bool
+) -> str:
     try:
         return tokenizer.apply_chat_template(
             messages,
@@ -97,7 +122,9 @@ def apply_chat_template(tokenizer: Any, messages: list[dict[str, str]], enable_t
         )
 
 
-def format_prompt(tokenizer: Any, messages: list[dict[str, str]], enable_thinking: bool) -> str:
+def format_prompt(
+    tokenizer: Any, messages: list[dict[str, str]], enable_thinking: bool
+) -> str:
     if hasattr(tokenizer, "apply_chat_template"):
         return apply_chat_template(tokenizer, messages, enable_thinking)
 
@@ -143,7 +170,9 @@ def print_help() -> None:
 
 def main() -> None:
     args = parse_args()
-    model_path = args.model or load_adapter_model_path(args.adapter_path) or DEFAULT_MODEL
+    model_path = (
+        args.model or load_adapter_model_path(args.adapter_path) or DEFAULT_MODEL
+    )
 
     if not args.adapter_path.exists():
         raise SystemExit(f"Adapter path does not exist: {args.adapter_path}")
@@ -218,7 +247,10 @@ def main() -> None:
             ):
                 text = chunk.text
                 chunks.append(text)
-                if any(marker in text for marker in ("<|im_end|>", "<|endoftext|>", "<|end_of_text|>")):
+                if any(
+                    marker in text
+                    for marker in ("<|im_end|>", "<|endoftext|>", "<|end_of_text|>")
+                ):
                     break
                 print(text, end="", flush=True)
             response = clean_response("".join(chunks))

@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import re
+import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,6 +23,17 @@ SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".heic", ".tiff", ".tif"}
 VLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "http://127.0.0.1:1234/v1")
 VLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "lmstudio-community:Qwen3.5-4B-MLX-4bit")
 VLM_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "not-needed")
+
+
+def artifact_prefix(name: str) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip()).strip("._-")
+    if not prefix:
+        raise ValueError("--name must contain at least one filename-safe character.")
+    return prefix
+
+
+def option_was_provided(option: str) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in sys.argv[1:])
 
 VLM_PROMPT = """
 你是一个微信聊天截图解析器。
@@ -1042,7 +1054,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Extract WeChat frame items. OCR is the default primary extractor; "
             "VLM can be selected explicitly or used as fallback."
-        )
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--method",
@@ -1050,8 +1063,13 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_METHOD,
         help="Extraction backend. Default: ocr.",
     )
-    parser.add_argument("--frames-dir", type=Path, default=DEFAULT_FRAMES_DIR)
-    parser.add_argument("--output-path", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Optional local artifact prefix, e.g. creates NAME_frames and NAME_raw_frame_items.jsonl.",
+    )
+    parser.add_argument("--frames-dir", "--frames", type=Path, default=DEFAULT_FRAMES_DIR)
+    parser.add_argument("--output-path", "--output", type=Path, default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS)
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument("--include-raw", action="store_true", default=DEFAULT_INCLUDE_RAW)
@@ -1070,7 +1088,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vlm-base-url", default=VLM_BASE_URL)
     parser.add_argument("--vlm-model", default=VLM_MODEL)
     parser.add_argument("--vlm-api-key", default=VLM_API_KEY)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.name:
+        prefix = artifact_prefix(args.name)
+        if not option_was_provided("--frames-dir") and not option_was_provided("--frames"):
+            args.frames_dir = Path(f"{prefix}_frames")
+        if not option_was_provided("--output-path") and not option_was_provided("--output"):
+            args.output_path = Path(f"{prefix}_raw_frame_items.jsonl")
+    return args
 
 
 def main() -> int:

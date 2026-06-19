@@ -1,11 +1,12 @@
 import argparse
 import json
 import re
+import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-DEFAULT_INPUT = Path("contact_ocr_raw_frame_items.jsonl")
+DEFAULT_INPUT = Path("contact_raw_frame_items.jsonl")
 DEFAULT_MESSAGES_OUTPUT = Path("data/train.jsonl")
 
 TEXT_TYPES = {"text"}
@@ -20,6 +21,17 @@ QUOTE_PREFIX_PATTERNS = [
     re.compile(r"^money is all you need\s*[:：]\s*.+$", re.IGNORECASE),
     re.compile(r"^CONTACT_NAME\s*[:：]\s*.+$"),
 ]
+
+
+def artifact_prefix(name: str) -> str:
+    prefix = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip()).strip("._-")
+    if not prefix:
+        raise ValueError("--name must contain at least one filename-safe character.")
+    return prefix
+
+
+def option_was_provided(option: str) -> bool:
+    return any(arg == option or arg.startswith(f"{option}=") for arg in sys.argv[1:])
 
 
 def frame_index_from_name(name: str) -> int:
@@ -339,7 +351,13 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Clean overlapping WeChat frame extraction JSONL into conversation data."
+        description="Clean overlapping WeChat frame extraction JSONL into SFT chat pairs.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Optional local artifact prefix, e.g. reads NAME_raw_frame_items.jsonl and writes data/NAME_train.jsonl.",
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument(
@@ -348,7 +366,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional debug output for cleaned bubble-level items.",
     )
-    parser.add_argument("--messages-output", type=Path, default=DEFAULT_MESSAGES_OUTPUT)
+    parser.add_argument(
+        "--messages-output",
+        "--output",
+        type=Path,
+        default=DEFAULT_MESSAGES_OUTPUT,
+        help="Output JSONL containing {'messages': [...]} SFT pairs.",
+    )
     parser.add_argument("--lookback", type=int, default=80)
     parser.add_argument("--min-overlap", type=int, default=2)
     parser.add_argument("--keep-incomplete", action="store_true")
@@ -364,7 +388,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep a final user message even when it has no assistant answer.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.name:
+        prefix = artifact_prefix(args.name)
+        if not option_was_provided("--input"):
+            args.input = Path(f"{prefix}_raw_frame_items.jsonl")
+        if not option_was_provided("--messages-output") and not option_was_provided("--output"):
+            args.messages_output = Path("data") / f"{prefix}_train.jsonl"
+        if args.items_output is not None and not option_was_provided("--items-output"):
+            args.items_output = Path(f"{prefix}_clean_items.jsonl")
+    return args
 
 
 def main() -> None:
