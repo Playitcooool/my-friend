@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_ADAPTER_PATH = Path("adapters/maruixiao")
-DEFAULT_MODEL = "/Volumes/Samsung/lmstudio/lmstudio-community/mlx-community:Qwen3.5-9B-MLX-4bit"
+DEFAULT_ADAPTER_PATH = Path("adapters/contact")
+DEFAULT_MODEL = "Qwen:Qwen3-14B-MLX-8bit"
 DEFAULT_SYSTEM_PROMPT = (
     "你正在微信聊天。用自然、简短、口语化的中文回复，保持训练数据里的语气和关系感。"
 )

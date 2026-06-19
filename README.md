@@ -56,14 +56,13 @@ Clean the frame-level extraction into bubble-level JSONL and SFT pair JSONL:
 python clean_wechat_conversation.py
 ```
 
-Outputs:
+Output:
 
 ```bash
-huxinyi_clean_items.jsonl
-huxinyi_clean_messages.jsonl
+data/train.jsonl
 ```
 
-`huxinyi_clean_messages.jsonl` contains one training example per line:
+`data/train.jsonl` contains one training example per line:
 
 ```json
 {"messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}
@@ -79,13 +78,13 @@ Create the data directory and use the cleaned JSONL as the training split:
 
 ```bash
 mkdir -p data
-cp huxinyi_clean_messages.jsonl data/train.jsonl
+python clean_wechat_conversation.py
 ```
 
 Optional validation split:
 
 ```bash
-cp huxinyi_clean_messages.jsonl data/valid.jsonl
+cp data/train.jsonl data/valid.jsonl
 ```
 
 Fine-tune using the project config:
@@ -98,11 +97,11 @@ Equivalent explicit command:
 
 ```bash
 mlx_lm.lora \
-  --model "/Volumes/Samsung/lmstudio/lmstudio-community/lmstudio-community:Qwen3.5-4B-MLX-8bit" \
+  --model "Qwen:Qwen3-14B-MLX-8bit" \
   --train \
   --fine-tune-type lora \
   --data ./data \
-  --adapter-path ./adapters/huxinyi \
+  --adapter-path ./adapters/contact \
   --batch-size 1 \
   --iters 1000 \
   --learning-rate 1e-5 \
@@ -115,7 +114,7 @@ mlx_lm.lora \
 The adapter weights are written to:
 
 ```bash
-adapters/huxinyi/
+adapters/contact/
 ```
 
 ## Inference with MLX-LM
@@ -124,8 +123,8 @@ Generate with the base model plus the trained LoRA adapter:
 
 ```bash
 mlx_lm.generate \
-  --model "/Volumes/Samsung/lmstudio/lmstudio-community/lmstudio-community:Qwen3.5-4B-MLX-8bit" \
-  --adapter-path ./adapters/huxinyi \
+  --model "Qwen:Qwen3-14B-MLX-8bit" \
+  --adapter-path ./adapters/contact \
   --prompt "晚上想吃什么？" \
   --max-tokens 256 \
   --temp 0.7
@@ -135,8 +134,8 @@ For chat-style prompts, format the prompt as a user turn:
 
 ```bash
 mlx_lm.generate \
-  --model "/Volumes/Samsung/lmstudio/lmstudio-community/lmstudio-community:Qwen3.5-4B-MLX-8bit" \
-  --adapter-path ./adapters/huxinyi \
+  --model "Qwen:Qwen3-14B-MLX-8bit" \
+  --adapter-path ./adapters/contact \
   --prompt '<|im_start|>user
 晚上想吃什么？
 <|im_end|>

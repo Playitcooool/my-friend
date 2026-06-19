@@ -5,9 +5,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-DEFAULT_INPUT = Path(
-    "/Volumes/Samsung/Projects/my-friend/maruixiao_ocr_raw_frame_items.jsonl"
-)
+DEFAULT_INPUT = Path("contact_ocr_raw_frame_items.jsonl")
 DEFAULT_MESSAGES_OUTPUT = Path("data/train.jsonl")
 
 TEXT_TYPES = {"text"}
@@ -20,7 +18,7 @@ RECALL_PATTERNS = [
 ]
 QUOTE_PREFIX_PATTERNS = [
     re.compile(r"^money is all you need\s*[:：]\s*.+$", re.IGNORECASE),
-    re.compile(r"^胡鑫怡\s*[:：]\s*.+$"),
+    re.compile(r"^CONTACT_NAME\s*[:：]\s*.+$"),
 ]
 
 

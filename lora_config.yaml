@@ -1,4 +1,4 @@
-model: "/Volumes/Samsung/lmstudio/lmstudio-community/lmstudio-community:Qwen3.5-4B-MLX-8bit"
+model: "Qwen:Qwen3-14B-MLX-8bit"
 train: true
 fine_tune_type: lora
 data: "./data"
@@ -15,7 +15,7 @@ steps_per_report: 10
 steps_per_eval: 100
 val_batches: 25
 
-adapter_path: "./adapters/huxinyi"
+adapter_path: "./adapters/contact"
 save_every: 100
 
 lora_parameters:

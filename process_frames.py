@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_FRAMES_DIR = Path(os.getenv("FRAMES_DIR", "maruixiao_frames"))
-DEFAULT_OUTPUT_PATH = Path(os.getenv("OUTPUT_PATH", "maruixiao_raw_frame_items.jsonl"))
+DEFAULT_FRAMES_DIR = Path(os.getenv("FRAMES_DIR", "contact_frames"))
+DEFAULT_OUTPUT_PATH = Path(os.getenv("OUTPUT_PATH", "contact_raw_frame_items.jsonl"))
 DEFAULT_MAX_WORKERS = int(os.getenv("MAX_CONCURRENCY", "2"))
 DEFAULT_MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
 DEFAULT_INCLUDE_RAW = os.getenv("INCLUDE_RAW", "0") != "0"
