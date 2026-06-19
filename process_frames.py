@@ -135,6 +135,58 @@ def has_failed_frames(output_path: Path) -> bool:
     return False
 
 
+def extraction_quality_summary(frames_dir: Path, output_path: Path) -> dict[str, Any]:
+    frames = get_frames(frames_dir) if frames_dir.exists() else []
+    successful_frames = 0
+    failed_frames = 0
+    empty_frames = 0
+    total_items = 0
+    output_rows = 0
+
+    if output_path.exists():
+        with output_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                output_rows += 1
+                if row.get("ok") is True:
+                    successful_frames += 1
+                    items = row.get("items")
+                    item_count = len(items) if isinstance(items, list) else 0
+                    total_items += item_count
+                    if item_count == 0:
+                        empty_frames += 1
+                elif row.get("ok") is False:
+                    failed_frames += 1
+
+    average_items = total_items / successful_frames if successful_frames else 0.0
+    warnings = []
+    if successful_frames and empty_frames / successful_frames >= 0.6:
+        warnings.append("most_successful_frames_are_empty")
+    if frames and output_rows and abs(output_rows - len(frames)) > max(2, len(frames) * 0.1):
+        warnings.append("output_row_count_mismatches_frame_count")
+
+    return {
+        "total_frames": len(frames),
+        "successful_frames": successful_frames,
+        "failed_frames": failed_frames,
+        "empty_frames": empty_frames,
+        "average_items_per_frame": round(average_items, 2),
+        "output_rows": output_rows,
+        "warnings": warnings,
+    }
+
+
+def print_extraction_quality_summary(frames_dir: Path, output_path: Path) -> None:
+    summary = extraction_quality_summary(frames_dir, output_path)
+    print("Extraction quality summary:")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
 def vertical_position(y_center_from_top: float) -> str:
     if y_center_from_top < 0.34:
         return "top"
@@ -931,6 +983,7 @@ def run_ocr(args: argparse.Namespace) -> None:
     print(f"Todo {len(todo)} frames.")
     if not todo:
         print("Nothing to do.")
+        print_extraction_quality_summary(args.frames_dir, args.output_path)
         return
 
     completed = 0
@@ -962,6 +1015,7 @@ def run_ocr(args: argparse.Namespace) -> None:
         f"({total_elapsed / total:.1f}s/frame, {total / total_elapsed * 60:.1f}/min)."
     )
     print(f"Saved to {args.output_path}")
+    print_extraction_quality_summary(args.frames_dir, args.output_path)
 
 
 async def run_vlm(args: argparse.Namespace) -> None:
@@ -994,6 +1048,7 @@ async def run_vlm(args: argparse.Namespace) -> None:
     print(f"Todo {len(todo)} frames.")
     if not todo:
         print("Nothing to do.")
+        print_extraction_quality_summary(args.frames_dir, args.output_path)
         return
 
     write_lock = asyncio.Lock()
@@ -1047,6 +1102,7 @@ async def run_vlm(args: argparse.Namespace) -> None:
         f"({total_elapsed / total:.1f}s/frame, {total / total_elapsed * 60:.1f}/min)."
     )
     print(f"Saved to {args.output_path}")
+    print_extraction_quality_summary(args.frames_dir, args.output_path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1090,7 +1146,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vlm-api-key", default=VLM_API_KEY)
     args = parser.parse_args()
     if args.name:
-        prefix = artifact_prefix(args.name)
+        try:
+            prefix = artifact_prefix(args.name)
+        except ValueError as exc:
+            parser.error(str(exc))
         if not option_was_provided("--frames-dir") and not option_was_provided("--frames"):
             args.frames_dir = Path(f"{prefix}_frames")
         if not option_was_provided("--output-path") and not option_was_provided("--output"):

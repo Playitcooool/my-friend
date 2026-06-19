@@ -8,6 +8,7 @@ from typing import Any
 
 DEFAULT_INPUT = Path("contact_raw_frame_items.jsonl")
 DEFAULT_MESSAGES_OUTPUT = Path("data/train.jsonl")
+DEFAULT_REPORT_OUTPUT = Path("data/train_quality_report.json")
 
 TEXT_TYPES = {"text"}
 MEDIA_TYPES = {"image", "sticker", "voice", "file", "transfer"}
@@ -43,6 +44,43 @@ def frame_index_from_name(name: str) -> int:
 
 def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def read_terms_file(path: Path | None) -> list[str]:
+    if path is None:
+        return []
+    terms = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            term = line.strip()
+            if term:
+                terms.append(term)
+    return terms
+
+
+def redact_text(text: str, custom_terms: list[str]) -> str:
+    text = re.sub(r"https?://\S+|www\.\S+", "[URL]", text)
+    text = re.sub(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", "[EMAIL]", text)
+    text = re.sub(r"(?<!\d)\d{12,}(?!\d)", "[ID]", text)
+    text = re.sub(r"(?<!\d)(?:\+?\d[\d\s-]{7,}\d)(?!\d)", "[PHONE]", text)
+    for term in sorted(set(custom_terms), key=len, reverse=True):
+        if term:
+            text = text.replace(term, "[NAME]")
+    return text
+
+
+def suspicious_ocr_reason(content: str) -> str | None:
+    compact = re.sub(r"\s+", "", content)
+    if len(compact) >= 8:
+        replacement_like = sum(1 for char in compact if char in {"�", "□", "�"})
+        if replacement_like / len(compact) > 0.15:
+            return "replacement_characters"
+        punctuation = sum(1 for char in compact if char in "|/\\_~^`")
+        if punctuation / len(compact) > 0.35:
+            return "punctuation_noise"
+    if re.search(r"[A-Za-z0-9]{24,}", compact):
+        return "long_unsegmented_token"
+    return None
 
 
 def is_recall_notice(content: str) -> bool:
@@ -183,19 +221,24 @@ def filter_items(
     keep_incomplete: bool,
     keep_media: bool,
     keep_system: bool,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], Counter[str]]:
+    stats: Counter[str] = Counter()
     filtered = []
     for item in items:
         if is_recall_notice(item["content"]):
+            stats["dropped_recall_notices"] += 1
             continue
         if item["role"] == "system" and not keep_system:
+            stats["dropped_system_items"] += 1
             continue
         if not item["complete"] and not keep_incomplete:
+            stats["dropped_incomplete_edge_items"] += 1
             continue
         if item["type"] in MEDIA_TYPES and not keep_media:
+            stats["dropped_media_placeholders"] += 1
             continue
         filtered.append(item)
-    return filtered
+    return filtered, stats
 
 
 def find_overlap(
@@ -248,7 +291,8 @@ def build_conversation(
     conversation: list[dict[str, Any]] = []
 
     for frame in frames:
-        items = filter_items(frame["_items"], keep_incomplete, keep_media, keep_system)
+        items, filter_stats = filter_items(frame["_items"], keep_incomplete, keep_media, keep_system)
+        stats.update(filter_stats)
         stats["candidate_items"] += len(items)
         if not items:
             continue
@@ -281,6 +325,17 @@ def build_conversation(
             collapsed.append(item)
         conversation = collapsed
 
+    unique = []
+    seen_messages: set[tuple[str, str, str]] = set()
+    for item in conversation:
+        signature = item_signature(item)
+        if signature in seen_messages:
+            stats["exact_duplicate_messages"] += 1
+            continue
+        seen_messages.add(signature)
+        unique.append(item)
+    conversation = unique
+
     for index, item in enumerate(conversation, start=1):
         item["index"] = index
 
@@ -303,12 +358,36 @@ def merge_messages(items: list[dict[str, Any]]) -> list[dict[str, str]]:
     return messages
 
 
+def redact_messages(
+    messages: list[dict[str, str]], enabled: bool, custom_terms: list[str]
+) -> tuple[list[dict[str, str]], int]:
+    redacted = []
+    changes = 0
+    for message in messages:
+        content = message["content"]
+        new_content = redact_text(content, custom_terms) if enabled else content
+        if new_content != content:
+            changes += 1
+        redacted.append({"role": message["role"], "content": new_content})
+    return redacted, changes
+
+
 def trim_dangling_final_user(
     messages: list[dict[str, str]],
 ) -> tuple[list[dict[str, str]], int]:
     if messages and messages[-1]["role"] == "user":
         return messages[:-1], 1
     return messages, 0
+
+
+def trim_leading_assistants(
+    messages: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], int]:
+    dropped = 0
+    while messages and messages[0]["role"] == "assistant":
+        messages = messages[1:]
+        dropped += 1
+    return messages, dropped
 
 
 def build_sft_pairs(
@@ -342,6 +421,52 @@ def build_sft_pairs(
     return pairs, stats
 
 
+def build_context_examples(
+    messages: list[dict[str, str]], context_turns: int
+) -> tuple[list[dict[str, list[dict[str, str]]]], Counter[str]]:
+    stats: Counter[str] = Counter()
+    examples = []
+    if context_turns < 0:
+        context_turns = 0
+    for index, message in enumerate(messages):
+        if message["role"] != "assistant":
+            continue
+        if index == 0:
+            stats["dropped_leading_assistant_messages"] += 1
+            continue
+        prior = messages[:index]
+        turn_messages: list[dict[str, str]] = []
+        turns = 0
+        for candidate in reversed(prior):
+            turn_messages.insert(0, candidate)
+            if candidate["role"] == "user":
+                turns += 1
+            if turns >= context_turns:
+                break
+        if not turn_messages or turn_messages[-1]["role"] != "user":
+            stats["dropped_context_without_user_prompt"] += 1
+            continue
+        examples.append({"messages": turn_messages + [message]})
+    stats["context_examples"] = len(examples)
+    return examples, stats
+
+
+def dedupe_examples(
+    examples: list[dict[str, list[dict[str, str]]]]
+) -> tuple[list[dict[str, list[dict[str, str]]]], int]:
+    unique = []
+    seen: set[str] = set()
+    duplicates = 0
+    for example in examples:
+        signature = json.dumps(example["messages"], ensure_ascii=False, sort_keys=True)
+        if signature in seen:
+            duplicates += 1
+            continue
+        seen.add(signature)
+        unique.append(example)
+    return unique, duplicates
+
+
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -351,7 +476,7 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Clean overlapping WeChat frame extraction JSONL into SFT chat pairs.",
+        description="Clean overlapping WeChat frame extraction JSONL into SFT examples.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -371,12 +496,26 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=DEFAULT_MESSAGES_OUTPUT,
-        help="Output JSONL containing {'messages': [...]} SFT pairs.",
+        help="Output JSONL containing {'messages': [...]} SFT examples.",
+    )
+    parser.add_argument("--report-output", type=Path, default=DEFAULT_REPORT_OUTPUT)
+    parser.add_argument(
+        "--example-mode",
+        choices=["context", "pair", "both"],
+        default="context",
+        help="Example construction mode. Pair preserves the legacy two-message rows.",
+    )
+    parser.add_argument(
+        "--context-turns",
+        type=int,
+        default=3,
+        help="Maximum prior user turns included before each final assistant response.",
     )
     parser.add_argument("--lookback", type=int, default=80)
     parser.add_argument("--min-overlap", type=int, default=2)
     parser.add_argument("--keep-incomplete", action="store_true")
     parser.add_argument("--drop-media", action="store_true")
+    parser.add_argument("--keep-media", action="store_true")
     parser.add_argument("--keep-system", action="store_true")
     parser.add_argument(
         "--keep-adjacent-frame-duplicates",
@@ -388,13 +527,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep a final user message even when it has no assistant answer.",
     )
+    parser.add_argument("--no-redact", action="store_true")
+    parser.add_argument("--redact-term", action="append", default=[])
+    parser.add_argument("--redact-terms-file", type=Path, default=None)
     args = parser.parse_args()
     if args.name:
-        prefix = artifact_prefix(args.name)
+        try:
+            prefix = artifact_prefix(args.name)
+        except ValueError as exc:
+            parser.error(str(exc))
         if not option_was_provided("--input"):
             args.input = Path(f"{prefix}_raw_frame_items.jsonl")
         if not option_was_provided("--messages-output") and not option_was_provided("--output"):
             args.messages_output = Path("data") / f"{prefix}_train.jsonl"
+        if not option_was_provided("--report-output"):
+            args.report_output = Path("data") / f"{prefix}_quality_report.json"
         if args.items_output is not None and not option_was_provided("--items-output"):
             args.items_output = Path(f"{prefix}_clean_items.jsonl")
     return args
@@ -406,38 +553,94 @@ def main() -> None:
     items, clean_stats = build_conversation(
         frames=frames,
         keep_incomplete=args.keep_incomplete,
-        keep_media=not args.drop_media,
+        keep_media=args.keep_media and not args.drop_media,
         keep_system=args.keep_system,
         collapse_adjacent_frame_duplicates=not args.keep_adjacent_frame_duplicates,
         lookback=args.lookback,
         min_overlap=args.min_overlap,
     )
     messages = merge_messages(items)
+    messages, trimmed_leading_assistants = trim_leading_assistants(messages)
     trimmed_final_user_messages = 0
     if not args.keep_dangling_final_user:
         messages, trimmed_final_user_messages = trim_dangling_final_user(messages)
-    pairs, pair_stats = build_sft_pairs(messages)
+    custom_terms = list(args.redact_term) + read_terms_file(args.redact_terms_file)
+    messages, redacted_messages = redact_messages(
+        messages, enabled=not args.no_redact, custom_terms=custom_terms
+    )
+
+    suspicious_items = []
+    for item in items:
+        reason = suspicious_ocr_reason(item["content"])
+        if reason:
+            suspicious_items.append(
+                {
+                    "frame": item.get("frame"),
+                    "index": item.get("index"),
+                    "role": item.get("role"),
+                    "reason": reason,
+                    "content": item.get("content", "")[:120],
+                }
+            )
+
+    examples: list[dict[str, list[dict[str, str]]]] = []
+    example_stats: Counter[str] = Counter()
+    if args.example_mode in {"context", "both"}:
+        context_examples, context_stats = build_context_examples(messages, args.context_turns)
+        examples.extend(context_examples)
+        example_stats.update(context_stats)
+    if args.example_mode in {"pair", "both"}:
+        pairs, pair_stats = build_sft_pairs(messages)
+        examples.extend(pairs)
+        example_stats.update(pair_stats)
+    examples, duplicate_examples = dedupe_examples(examples)
 
     if args.items_output is not None:
         write_jsonl(args.items_output, items)
-    write_jsonl(args.messages_output, pairs)
+    write_jsonl(args.messages_output, examples)
 
-    stats = load_stats + clean_stats + pair_stats
+    stats = load_stats + clean_stats + example_stats
     stats["messages"] = len(messages)
+    stats["trimmed_leading_assistant_messages"] = trimmed_leading_assistants
     stats["trimmed_final_user_messages"] = trimmed_final_user_messages
+    stats["redacted_messages"] = redacted_messages
+    stats["duplicate_examples"] = duplicate_examples
+    stats["examples"] = len(examples)
+    stats["suspicious_ocr_items"] = len(suspicious_items)
+
+    args.report_output.parent.mkdir(parents=True, exist_ok=True)
+    args.report_output.write_text(
+        json.dumps(
+            {
+                "input": str(args.input),
+                "output": str(args.messages_output),
+                "example_mode": args.example_mode,
+                "context_turns": args.context_turns,
+                "redaction_enabled": not args.no_redact,
+                "stats": dict(stats),
+                "suspicious_ocr_samples": suspicious_items[:50],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     print(f"Read {stats['input_frames']} frames and {stats['input_items']} raw items.")
     print(
         f"Kept {stats['clean_items']} cleaned items, "
         f"deduped {stats['deduped_items']} overlaps, "
         f"collapsed {stats['adjacent_frame_duplicates']} adjacent frame duplicates, "
+        f"trimmed {stats['trimmed_leading_assistant_messages']} leading assistant messages, "
         f"trimmed {stats['trimmed_final_user_messages']} dangling final user messages, "
         f"merged into {stats['messages']} messages, "
-        f"wrote {stats['pairs']} SFT pairs."
+        f"wrote {stats['examples']} SFT examples."
     )
     if args.items_output is not None:
         print(f"Wrote {args.items_output}")
     print(f"Wrote {args.messages_output}")
+    print(f"Wrote {args.report_output}")
 
 
 if __name__ == "__main__":

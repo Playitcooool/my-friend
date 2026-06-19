@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import re
 import sys
 from pathlib import Path
@@ -10,6 +11,7 @@ from urllib.parse import urlparse
 
 DEFAULT_INPUT = Path("data/train.jsonl")
 DEFAULT_OUTPUT = Path("data/train.roleplay_filtered.jsonl")
+DEFAULT_VALID_OUTPUT = Path("data/valid.roleplay_filtered.jsonl")
 DEFAULT_JUDGMENTS_OUTPUT = Path("data/train.roleplay_judgments.jsonl")
 
 RATINGS = ("high", "medium", "low", "incomplete", "invalid")
@@ -94,9 +96,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--valid-output", type=Path, default=DEFAULT_VALID_OUTPUT)
     parser.add_argument(
         "--judgments-output", type=Path, default=DEFAULT_JUDGMENTS_OUTPUT
     )
+    parser.add_argument("--valid-ratio", type=float, default=0.1)
+    parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--base-url", default="http://localhost:1234")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--model", default="mlx-community:Qwen3.5-9B-MLX-4bit")
@@ -118,11 +123,16 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if args.name:
-        prefix = artifact_prefix(args.name)
+        try:
+            prefix = artifact_prefix(args.name)
+        except ValueError as exc:
+            parser.error(str(exc))
         if not option_was_provided("--input"):
             args.input = Path("data") / f"{prefix}_train.jsonl"
         if not option_was_provided("--output"):
-            args.output = Path("data") / f"{prefix}.roleplay_filtered.jsonl"
+            args.output = Path("data") / f"{prefix}_train.filtered.jsonl"
+        if not option_was_provided("--valid-output"):
+            args.valid_output = Path("data") / f"{prefix}_valid.filtered.jsonl"
         if not option_was_provided("--judgments-output"):
             args.judgments_output = Path("data") / f"{prefix}.roleplay_judgments.jsonl"
     return args
@@ -155,9 +165,28 @@ def normalize_judgment(raw: Any) -> dict[str, Any]:
         issues = []
     issues = [str(issue)[:80] for issue in issues]
 
+    def int_score(key: str) -> int:
+        try:
+            value = int(raw.get(key, 0))
+        except (TypeError, ValueError):
+            value = 0
+        return max(0, min(5, value))
+
+    privacy_risk = raw.get("privacy_risk")
+    if privacy_risk not in {"low", "medium", "high"}:
+        privacy_risk = "medium"
+    short_reply_type = raw.get("short_reply_type")
+    if short_reply_type not in {"none", "useful_style", "generic_ack", "duplicate_noise"}:
+        short_reply_type = "none"
+
     return {
         "rating": rating,
-        "keep": bool(raw.get("keep")) and rating in KEEP_RATINGS,
+        "keep": bool(raw.get("keep")),
+        "style_score": int_score("style_score"),
+        "context_score": int_score("context_score"),
+        "quality_score": int_score("quality_score"),
+        "privacy_risk": privacy_risk,
+        "short_reply_type": short_reply_type,
         "style_signal": str(raw.get("style_signal", ""))[:300],
         "issues": issues,
         "reason": str(raw.get("reason", ""))[:600],
@@ -168,6 +197,11 @@ def invalid_judgment(reason: str, issues: list[str] | None = None) -> dict[str, 
     return {
         "rating": "invalid",
         "keep": False,
+        "style_score": 0,
+        "context_score": 0,
+        "quality_score": 0,
+        "privacy_risk": "medium",
+        "short_reply_type": "none",
         "style_signal": "",
         "issues": issues or ["invalid_schema"],
         "reason": reason,
@@ -181,18 +215,19 @@ def validate_messages(obj: Any) -> tuple[bool, str]:
     messages = obj.get("messages")
     if not isinstance(messages, list):
         return False, "messages is not a list"
-    if len(messages) != 2:
-        return False, "messages must contain exactly two items"
+    if not messages:
+        return False, "messages is empty"
 
-    expected_roles = ("user", "assistant")
-    for index, (message, expected_role) in enumerate(zip(messages, expected_roles)):
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
             return False, f"message {index} is not an object"
-        if message.get("role") != expected_role:
-            return False, f"message {index} role is not {expected_role}"
+        if message.get("role") not in {"user", "assistant", "system"}:
+            return False, f"message {index} role is invalid"
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             return False, f"message {index} content is empty or not a string"
+    if messages[-1].get("role") != "assistant":
+        return False, "final message role must be assistant"
 
     return True, ""
 
@@ -270,6 +305,11 @@ def build_user_prompt(messages: list[dict[str, str]]) -> str:
             "required_output": {
                 "rating": "high|medium|low|incomplete|invalid",
                 "keep": "boolean",
+                "style_score": "integer 1-5",
+                "context_score": "integer 1-5",
+                "quality_score": "integer 1-5",
+                "privacy_risk": "low|medium|high",
+                "short_reply_type": "none|useful_style|generic_ack|duplicate_noise",
                 "style_signal": "short string",
                 "issues": ["short issue labels"],
                 "reason": "short string",
@@ -375,10 +415,35 @@ def should_keep(judgment: dict[str, Any], min_rating: str) -> bool:
     rating = judgment.get("rating")
     if rating not in MIN_RATING_ORDER:
         return False
+    issues = set(judgment.get("issues") or [])
     return (
         bool(judgment.get("keep"))
         and MIN_RATING_ORDER[rating] >= MIN_RATING_ORDER[min_rating]
+        and rating in KEEP_RATINGS
+        and int(judgment.get("quality_score", 0)) >= 4
+        and int(judgment.get("context_score", 0)) >= 3
+        and judgment.get("privacy_risk") != "high"
+        and judgment.get("short_reply_type") != "duplicate_noise"
+        and "duplicate_noise" not in issues
     )
+
+
+def split_train_valid(
+    rows: list[dict[str, Any]], valid_ratio: float, seed: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not rows:
+        return [], []
+    ratio = max(0.0, min(1.0, valid_ratio))
+    indexes = list(range(len(rows)))
+    rng = random.Random(seed)
+    rng.shuffle(indexes)
+    valid_count = int(len(rows) * ratio)
+    if ratio > 0 and len(rows) > 1 and valid_count == 0:
+        valid_count = 1
+    valid_indexes = set(indexes[:valid_count])
+    train = [row for index, row in enumerate(rows) if index not in valid_indexes]
+    valid = [row for index, row in enumerate(rows) if index in valid_indexes]
+    return train, valid
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -408,6 +473,8 @@ async def async_main() -> int:
         raise SystemExit("--max-retries must be at least 0.")
     if args.request_timeout <= 0:
         raise SystemExit("--request-timeout must be greater than 0.")
+    if not 0 <= args.valid_ratio <= 1:
+        raise SystemExit("--valid-ratio must be between 0 and 1.")
 
     input_rows = load_input(args.input, args.limit)
     existing = load_existing_judgments(args.judgments_output) if args.resume else {}
@@ -458,20 +525,15 @@ async def async_main() -> int:
     log(f"Prepared {len(pending)} rows for LLM judging")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text("", encoding="utf-8")
-    log(f"Initialized filtered output at {args.output}")
+    args.valid_output.parent.mkdir(parents=True, exist_ok=True)
+    args.valid_output.write_text("", encoding="utf-8")
+    log(f"Initialized filtered outputs at {args.output} and {args.valid_output}")
 
     args.judgments_output.parent.mkdir(parents=True, exist_ok=True)
     args.judgments_output.write_text("", encoding="utf-8")
     for line_number in sorted(records_by_line):
         record = records_by_line[line_number]
         append_jsonl(args.judgments_output, record)
-        if record.get("duplicate_of_line") is None and should_keep(
-            record["judgment"], args.min_rating
-        ):
-            try:
-                append_jsonl(args.output, json.loads(record["row"]))
-            except (json.JSONDecodeError, TypeError):
-                pass
     log(f"Initialized incremental judgments at {args.judgments_output}")
 
     if pending:
@@ -489,8 +551,6 @@ async def async_main() -> int:
             )
             records_by_line[line_number] = record
             append_jsonl(args.judgments_output, record)
-            if should_keep(record["judgment"], args.min_rating):
-                append_jsonl(args.output, obj_by_line[line_number])
 
         judgments = await judge_pending(
             pending=pending,
@@ -526,10 +586,16 @@ async def async_main() -> int:
         ):
             kept_rows.append(obj)
 
+    train_rows, valid_rows = split_train_valid(
+        kept_rows, valid_ratio=args.valid_ratio, seed=args.split_seed
+    )
+
     write_jsonl(args.judgments_output, judgment_rows)
-    write_jsonl(args.output, kept_rows)
+    write_jsonl(args.output, train_rows)
+    write_jsonl(args.valid_output, valid_rows)
     log(f"Wrote sorted judgments to {args.judgments_output}")
-    log(f"Wrote filtered rows to {args.output}")
+    log(f"Wrote filtered train rows to {args.output}")
+    log(f"Wrote filtered valid rows to {args.valid_output}")
 
     rating_counts: dict[str, int] = {}
     for record in judgment_rows:
@@ -542,8 +608,13 @@ async def async_main() -> int:
                 "input_rows": len(input_rows),
                 "judged_rows": len(pending),
                 "kept_rows": len(kept_rows),
+                "train_rows": len(train_rows),
+                "valid_rows": len(valid_rows),
                 "judgments_output": str(args.judgments_output),
-                "filtered_output": str(args.output),
+                "train_output": str(args.output),
+                "valid_output": str(args.valid_output),
+                "valid_ratio": args.valid_ratio,
+                "split_seed": args.split_seed,
                 "ratings": rating_counts,
             },
             ensure_ascii=False,

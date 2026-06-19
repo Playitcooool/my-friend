@@ -68,7 +68,11 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if args.name and not option_was_provided("--adapter-path"):
-        args.adapter_path = Path("adapters") / artifact_prefix(args.name)
+        try:
+            prefix = artifact_prefix(args.name)
+        except ValueError as exc:
+            parser.error(str(exc))
+        args.adapter_path = Path("adapters") / prefix
     return args
 
 

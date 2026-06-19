@@ -10,7 +10,7 @@ JSONL files, trained adapters, and model configs are ignored by git by default.
 ## Workflow
 
 ```text
-screen recording -> ffmpeg frames -> OCR/VLM extraction -> clean SFT pairs -> judge/filter -> LoRA -> terminal chat
+screen recording -> extract frames -> OCR/VLM extraction -> clean context SFT data -> judge/split -> LoRA -> terminal chat
 ```
 
 ## Quick Start
@@ -25,6 +25,7 @@ uv pip install openai "mlx-lm[train]" pyobjc-framework-Vision pyobjc-framework-Q
 Use the default private artifact names:
 
 ```bash
+uv run python extract_frames.py --video screen_recording.mp4
 uv run python process_frames.py
 uv run python clean_wechat_conversation.py
 uv run python judge_roleplay_value.py --model YOUR_JUDGE_MODEL
@@ -35,6 +36,7 @@ uv run python chat_with_adapter.py
 Use an explicit local contact prefix when you want named artifacts:
 
 ```bash
+uv run python extract_frames.py --video screen_recording.mp4 --name CONTACT_ALIAS
 uv run python process_frames.py --name CONTACT_ALIAS
 uv run python clean_wechat_conversation.py --name CONTACT_ALIAS
 uv run python judge_roleplay_value.py --name CONTACT_ALIAS --model YOUR_JUDGE_MODEL
@@ -47,7 +49,8 @@ With `--name CONTACT_ALIAS`, the default artifacts become:
 | --- | --- |
 | Extract frames | `CONTACT_ALIAS_frames/`, `CONTACT_ALIAS_raw_frame_items.jsonl` |
 | Clean data | `CONTACT_ALIAS_raw_frame_items.jsonl` -> `data/CONTACT_ALIAS_train.jsonl` |
-| Judge/filter | `data/CONTACT_ALIAS.roleplay_filtered.jsonl` and `data/CONTACT_ALIAS.roleplay_judgments.jsonl` |
+| Quality report | `data/CONTACT_ALIAS_quality_report.json` |
+| Judge/filter | `data/CONTACT_ALIAS_train.filtered.jsonl`, `data/CONTACT_ALIAS_valid.filtered.jsonl`, and `data/CONTACT_ALIAS.roleplay_judgments.jsonl` |
 | Chat | `adapters/CONTACT_ALIAS/` |
 
 Explicit paths always override `--name`.
@@ -62,7 +65,7 @@ into image frames for OCR.
 2. Start a screen recording.
 3. Scroll upward or downward slowly and steadily through the chat history.
 4. Stop recording and save the video locally.
-5. Extract frames with `ffmpeg`.
+5. Extract frames with `extract_frames.py`.
 
 Install `ffmpeg` if needed:
 
@@ -73,21 +76,25 @@ brew install ffmpeg
 Extract one frame every second:
 
 ```bash
-mkdir -p contact_frames
-ffmpeg -i screen_recording.mp4 -vf fps=1 contact_frames/frame%06d.png
+uv run python extract_frames.py --video screen_recording.mp4
 ```
 
 For a named local artifact set:
 
 ```bash
-mkdir -p CONTACT_ALIAS_frames
-ffmpeg -i screen_recording.mp4 -vf fps=1 CONTACT_ALIAS_frames/frame%06d.png
+uv run python extract_frames.py --video screen_recording.mp4 --name CONTACT_ALIAS
 ```
 
 If the recording scrolls quickly, use more frames:
 
 ```bash
-ffmpeg -i screen_recording.mp4 -vf fps=2 CONTACT_ALIAS_frames/frame%06d.png
+uv run python extract_frames.py --video screen_recording.mp4 --name CONTACT_ALIAS --fps 2
+```
+
+To cut only part of a recording:
+
+```bash
+uv run python extract_frames.py --video screen_recording.mp4 --start 00:01:00 --duration 00:02:30 --overwrite
 ```
 
 Tips:
@@ -135,21 +142,19 @@ brew install ffmpeg
 默认匿名产物：
 
 ```bash
-mkdir -p contact_frames
-ffmpeg -i screen_recording.mp4 -vf fps=1 contact_frames/frame%06d.png
+uv run python extract_frames.py --video screen_recording.mp4
 ```
 
 如果你想在本地用联系人别名区分不同数据集：
 
 ```bash
-mkdir -p CONTACT_ALIAS_frames
-ffmpeg -i screen_recording.mp4 -vf fps=1 CONTACT_ALIAS_frames/frame%06d.png
+uv run python extract_frames.py --video screen_recording.mp4 --name CONTACT_ALIAS
 ```
 
 如果滚动速度比较快，可以提高抽帧频率：
 
 ```bash
-ffmpeg -i screen_recording.mp4 -vf fps=2 CONTACT_ALIAS_frames/frame%06d.png
+uv run python extract_frames.py --video screen_recording.mp4 --name CONTACT_ALIAS --fps 2
 ```
 
 ### 3. 提取、清洗、过滤
@@ -177,7 +182,9 @@ uv run python judge_roleplay_value.py --name CONTACT_ALIAS --model YOUR_JUDGE_MO
 | 切帧 | `CONTACT_ALIAS_frames/` |
 | OCR/VLM 提取 | `CONTACT_ALIAS_raw_frame_items.jsonl` |
 | 清洗训练数据 | `data/CONTACT_ALIAS_train.jsonl` |
-| 过滤后训练数据 | `data/CONTACT_ALIAS.roleplay_filtered.jsonl` |
+| 清洗质量报告 | `data/CONTACT_ALIAS_quality_report.json` |
+| 过滤后训练数据 | `data/CONTACT_ALIAS_train.filtered.jsonl` |
+| 验证集 | `data/CONTACT_ALIAS_valid.filtered.jsonl` |
 | 审核记录 | `data/CONTACT_ALIAS.roleplay_judgments.jsonl` |
 
 ### 4. 微调和聊天
@@ -205,7 +212,24 @@ uv run python chat_with_adapter.py --name CONTACT_ALIAS
 
 ## Commands
 
-### 1. Extract Frame Items
+### 1. Extract Frames
+
+```bash
+uv run python extract_frames.py --video screen_recording.mp4
+```
+
+Useful options:
+
+```bash
+uv run python extract_frames.py --video screen_recording.mp4 --name CONTACT_ALIAS
+uv run python extract_frames.py --video screen_recording.mp4 --fps 2 --frames-dir frames
+uv run python extract_frames.py --video screen_recording.mp4 --start 00:00:30 --duration 60 --overwrite
+```
+
+`--name CONTACT_ALIAS` maps to `CONTACT_ALIAS_frames/`. Explicit path flags
+always override `--name`.
+
+### 2. Extract Frame Items
 
 Put extracted frames in `contact_frames/` or pass `--frames`.
 
@@ -223,8 +247,11 @@ uv run python process_frames.py --method ocr-with-vlm-fallback
 
 OCR uses Apple Vision and groups OCR text lines into chat bubbles by default.
 Use `--disable-bubble-grouping` only when you need line-level debugging output.
+After processing, the script prints a quality summary with total frames,
+successful frames, failed frames, empty frames, average items per frame, and
+warnings when the output count looks mismatched.
 
-### 2. Clean SFT Pairs
+### 3. Clean SFT Examples
 
 ```bash
 uv run python clean_wechat_conversation.py
@@ -236,10 +263,11 @@ Default output:
 data/train.jsonl
 ```
 
-Each row has the standard SFT shape:
+Each row has the standard SFT shape and ends with an assistant message. The
+default mode builds multi-turn context windows:
 
 ```json
-{"messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}
+{"messages":[{"role":"user","content":"..."},{"role":"assistant","content":"..."},{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}
 ```
 
 Useful options:
@@ -247,12 +275,25 @@ Useful options:
 ```bash
 uv run python clean_wechat_conversation.py --input raw_items.jsonl --output data/train.jsonl
 uv run python clean_wechat_conversation.py --items-output debug_clean_items.jsonl
+uv run python clean_wechat_conversation.py --example-mode pair
+uv run python clean_wechat_conversation.py --context-turns 3
+uv run python clean_wechat_conversation.py --redact-term "Local Name" --redact-terms-file private_terms.txt
+uv run python clean_wechat_conversation.py --no-redact
 ```
 
 The cleaner removes overlapping frame duplicates, recall notices, quoted-message
-prefixes, incomplete edge bubbles, and dangling final user turns.
+prefixes, media placeholders by default, incomplete edge bubbles, leading
+assistant turns, dangling final user turns, exact duplicate messages, and exact
+duplicate examples. Privacy redaction is enabled by default for phone numbers,
+emails, URLs, long ID-like numbers, and custom terms. The quality report is
+written to `data/train_quality_report.json` or `data/CONTACT_ALIAS_quality_report.json`.
 
-### 3. Judge And Filter
+The quality report records counts for dropped rows, duplicate removal,
+redaction, suspicious OCR samples, and final example totals. If many frames are
+empty or suspicious OCR counts are high, slow down scrolling, increase `--fps`,
+or inspect `--items-output`.
+
+### 4. Judge, Filter, And Split
 
 ```bash
 uv run python judge_roleplay_value.py --model YOUR_JUDGE_MODEL
@@ -262,11 +303,14 @@ Default outputs:
 
 ```text
 data/train.roleplay_filtered.jsonl
+data/valid.roleplay_filtered.jsonl
 data/train.roleplay_judgments.jsonl
 ```
 
-The filtered JSONL is the training-ready output. The judgments JSONL is kept so
-you can audit why rows were kept or dropped.
+The filtered JSONL files are training-ready train/validation splits. The
+validation split is deterministic by default with `--valid-ratio 0.1` and
+`--split-seed 42`. The judgments JSONL is kept so you can audit why rows were
+kept or dropped.
 
 For OpenAI-compatible local servers:
 
@@ -278,7 +322,15 @@ uv run python judge_roleplay_value.py \
   --resume
 ```
 
-### 4. Fine-Tune
+Named artifacts default to:
+
+```text
+data/CONTACT_ALIAS_train.filtered.jsonl
+data/CONTACT_ALIAS_valid.filtered.jsonl
+data/CONTACT_ALIAS.roleplay_judgments.jsonl
+```
+
+### 5. Fine-Tune
 
 Edit `lora_config.yaml` for your local base model and adapter path, then run:
 
@@ -304,7 +356,7 @@ mlx_lm.lora \
   --mask-prompt
 ```
 
-### 5. Chat In The Terminal
+### 6. Chat In The Terminal
 
 ```bash
 uv run python chat_with_adapter.py
